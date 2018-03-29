@@ -13,7 +13,14 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 
+#include <sys/mman.h> // mlock()
 #include <security/pam_appl.h> 
+
+#ifdef __GNUC__
+    #define UNUSED(x) UNUSED_ ## x __attribute__((__unused__))
+#else
+    #define UNUSED(x) UNUSED_ ## x
+#endif
 
 typedef struct {
     int screen;
@@ -22,9 +29,61 @@ typedef struct {
     unsigned long colors[2];
 } Lock;
 
+static int conv_callback(int num_msgs, const struct pam_message **msg, struct pam_response **resp, void *appdata_ptr);
+
+pam_handle_t *pam_handle;
+struct pam_conv conv = { conv_callback, NULL };
+
 static Lock **locks;
 static int nscreens;
 static Bool running = True;
+
+/* Holds the password you enter */
+static char password[256];
+
+/*
+ * Clears the memory which stored the password to be a bit safer against
+ * cold-boot attacks.
+ *
+ */
+static void
+clear_password_memory(void) {
+    /* A volatile pointer to the password buffer to prevent the compiler from
+     * optimizing this out. */
+    volatile char *vpassword = password;
+    for (unsigned int c = 0; c < sizeof(password); c++)
+        /* rewrite with random values */
+        vpassword[c] = rand();
+}
+
+/*
+ * Callback function for PAM. We only react on password request callbacks.
+ *
+ */
+static int
+conv_callback(int num_msgs, const struct pam_message **msg, struct pam_response **resp, void *UNUSED(appdata_ptr)) {
+    if (num_msgs == 0)
+        return PAM_BUF_ERR;
+
+    // PAM expects an array of responses, one for each message
+    if ((*resp = calloc(num_msgs, sizeof(struct pam_message))) == NULL)
+        return PAM_BUF_ERR;
+
+    for (int i = 0; i < num_msgs; i++) {
+        if (msg[i]->msg_style != PAM_PROMPT_ECHO_OFF &&
+            msg[i]->msg_style != PAM_PROMPT_ECHO_ON)
+            continue;
+
+        // return code is currently not used but should be set to zero
+        resp[i]->resp_retcode = 0;
+        if ((resp[i]->resp = strdup(password)) == NULL) {
+            free(*resp);
+            return PAM_BUF_ERR;
+        }
+    }
+
+    return PAM_SUCCESS;
+}
 
 static void
 die(const char *errstr, ...) {
@@ -36,42 +95,10 @@ die(const char *errstr, ...) {
     exit(EXIT_FAILURE);
 }
 
-static int conversation(int num_msg, const struct pam_message **msg, struct pam_response **resp, void *reply)   {  
-    *resp = reply;
-    return PAM_SUCCESS;  
-}
-
-static int auth(const char *password) {
-    pam_handle_t* pamh; 
-    struct passwd *pw;
-    if ((pw = getpwuid(getuid())) == NULL)
-        return 0;
-
-    struct pam_response * reply = malloc(sizeof(struct pam_response));
-    if (!reply)
-        return 0;
-
-    struct pam_conv pamc = { conversation, reply };
-    int rc = 0;
-
-    reply->resp = strdup(password);
-    reply->resp_retcode = 0; 
-    pam_start("slock", pw->pw_name, &pamc, &pamh);
-    if (pam_set_item(pamh, PAM_AUTHTOK, password) == PAM_SUCCESS        &&
-        pam_authenticate(pamh,PAM_DISALLOW_NULL_AUTHTOK) == PAM_SUCCESS &&
-        pam_acct_mgmt(pamh, 0) == PAM_SUCCESS                           &&
-        pam_setcred(pamh, PAM_REFRESH_CRED) == PAM_SUCCESS) {
-           rc = 1;
-    }
-    pam_end(pamh,0);
-    return rc;
-}
-
 static void
 readpw(Display *dpy)
 {
-    char buf[32], passwd[256];
-    int num, screen;
+    int screen;
     unsigned int len, llen;
     KeySym ksym;
     XEvent ev;
@@ -85,8 +112,8 @@ readpw(Display *dpy)
      * timeout. */
     while(running && !XNextEvent(dpy, &ev)) {
         if(ev.type == KeyPress) {
-            buf[0] = 0;
-            num = XLookupString(&ev.xkey, buf, sizeof buf, &ksym, 0);
+	    char inputChar = 0;
+	    XLookupString(&ev.xkey, &inputChar, sizeof(inputChar), &ksym, 0);
             if(IsKeypadKey(ksym)) {
                 if(ksym == XK_KP_Enter)
                     ksym = XK_Return;
@@ -99,10 +126,14 @@ readpw(Display *dpy)
                 continue;
             switch(ksym) {
             case XK_Return:
-                passwd[len] = 0;
-                running = !auth(passwd);
-                if(running)
-                    XBell(dpy, 100);
+                password[len] = 0;
+                if(pam_authenticate(pam_handle, 0) == PAM_SUCCESS) {
+		    clear_password_memory();
+                    running = False;
+		} else {
+		    XBell(dpy, 100);
+		    running = True;
+		}
                 len = 0;
                 break;
             case XK_Escape:
@@ -113,9 +144,9 @@ readpw(Display *dpy)
                     --len;
                 break;
             default:
-                if(num && !iscntrl((int) buf[0]) && (len + num < sizeof passwd)) { 
-                    memcpy(passwd + len, buf, num);
-                    len += num;
+                if (isprint(inputChar) && (len + sizeof(inputChar) < sizeof password)) {
+                    memcpy(password + len, &inputChar, sizeof(inputChar));
+                    len += sizeof(inputChar);
                 }
                 break;
             }
@@ -238,6 +269,23 @@ main(int argc, char **argv) {
         XCloseDisplay(dpy);
         return 1;
     }
+
+    char* username;
+    if ((username = getenv("USER")) == NULL)
+        die("USER environment variable not set, please set it.\n");
+
+    /* set up PAM */
+    {
+        int ret = pam_start("slock", username, &conv, &pam_handle);
+        if (ret != PAM_SUCCESS)
+            die("PAM: %s\n", pam_strerror(pam_handle, ret));
+    }
+
+    /* Lock the area where we store the password in memory, we don’t want it to
+     * be swapped to disk. Since Linux 2.6.9, this does not require any
+     * privileges, just enough bytes in the RLIMIT_MEMLOCK limit. */
+    if (mlock(password, sizeof(password)) != 0)
+        die("Could not lock page in memory, check RLIMIT_MEMLOCK\n");
 
     /* Everything is now blank. Now wait for the correct password. */
     readpw(dpy);
