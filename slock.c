@@ -16,6 +16,8 @@
 #include <sys/mman.h> // mlock()
 #include <security/pam_appl.h> 
 
+#include <time.h>
+
 #ifdef __GNUC__
     #define UNUSED(x) UNUSED_ ## x __attribute__((__unused__))
 #else
@@ -26,7 +28,7 @@ typedef struct {
     int screen;
     Window root, win;
     Pixmap pmap;
-    unsigned long colors[2];
+    unsigned long colors[4];
 } Lock;
 
 static int conv_callback(int num_msgs, const struct pam_message **msg, struct pam_response **resp, void *appdata_ptr);
@@ -62,12 +64,14 @@ clear_password_memory(void) {
  */
 static int
 conv_callback(int num_msgs, const struct pam_message **msg, struct pam_response **resp, void *UNUSED(appdata_ptr)) {
-    if (num_msgs == 0)
+    if (num_msgs == 0) {
         return PAM_BUF_ERR;
+    }
 
     // PAM expects an array of responses, one for each message
-    if ((*resp = calloc(num_msgs, sizeof(struct pam_message))) == NULL)
+    if ((*resp = calloc(num_msgs, sizeof(struct pam_message))) == NULL) {
         return PAM_BUF_ERR;
+    }
 
     for (int i = 0; i < num_msgs; i++) {
         if (msg[i]->msg_style != PAM_PROMPT_ECHO_OFF &&
@@ -96,15 +100,25 @@ die(const char *errstr, ...) {
 }
 
 static void
+refreshwindow(Display *dpy, int color) {
+    for(int screen = 0; screen < nscreens; screen++) {
+       XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[color]);
+       XClearWindow(dpy, locks[screen]->win);
+    }
+}	
+
+static void
 readpw(Display *dpy)
 {
     int screen;
     unsigned int len, llen;
     KeySym ksym;
     XEvent ev;
+    Bool performlogin;
 
     len = llen = 0;
     running = True;
+    performlogin = False;
 
     /* As "slock" stands for "Simple X display locker", the DPMS settings
      * had been removed and you can set it with "xset" or some other
@@ -126,16 +140,9 @@ readpw(Display *dpy)
                 continue;
             switch(ksym) {
             case XK_Return:
-                password[len] = 0;
-                if(pam_authenticate(pam_handle, 0) == PAM_SUCCESS) {
-		    clear_password_memory();
-                    running = False;
-		} else {
-		    XBell(dpy, 100);
-		    running = True;
-		}
-                len = 0;
-                break;
+                refreshwindow(dpy, 3);
+                performlogin = True;
+		break;
             case XK_Escape:
                 len = 0;
                 break;
@@ -151,20 +158,29 @@ readpw(Display *dpy)
                 break;
             }
             if(llen == 0 && len != 0) {
-                for(screen = 0; screen < nscreens; screen++) {
-                    XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[1]);
-                    XClearWindow(dpy, locks[screen]->win);
-                }
+                refreshwindow(dpy, 1);
             } else if(llen != 0 && len == 0) {
-                for(screen = 0; screen < nscreens; screen++) {
-                    XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[0]);
-                    XClearWindow(dpy, locks[screen]->win);
-                }
-            }
+                refreshwindow(dpy, 0);
+	    }
             llen = len;
         }
-        else for(screen = 0; screen < nscreens; screen++)
-            XRaiseWindow(dpy, locks[screen]->win);
+        else {
+            for(screen = 0; screen < nscreens; screen++)
+                XRaiseWindow(dpy, locks[screen]->win);
+	    if(performlogin) {
+                password[len] = 0;
+		if(pam_authenticate(pam_handle, 0) == PAM_SUCCESS) {
+		    clear_password_memory();
+                    running = False;
+		} else {
+		    XBell(dpy, 100);
+		    running = True;
+                    refreshwindow(dpy, 2);
+		}
+                len = 0;
+		performlogin = False;
+	    }
+	}
     }
 }
 
@@ -174,7 +190,7 @@ unlockscreen(Display *dpy, Lock *lock) {
         return;
 
     XUngrabPointer(dpy, CurrentTime);
-    XFreeColors(dpy, DefaultColormap(dpy, lock->screen), lock->colors, 2, 0);
+    XFreeColors(dpy, DefaultColormap(dpy, lock->screen), lock->colors, 4, 0);
     XFreePixmap(dpy, lock->pmap);
     XDestroyWindow(dpy, lock->win);
 
@@ -207,6 +223,11 @@ lockscreen(Display *dpy, int screen) {
     lock->win = XCreateWindow(dpy, lock->root, 0, 0, DisplayWidth(dpy, lock->screen), DisplayHeight(dpy, lock->screen),
             0, DefaultDepth(dpy, lock->screen), CopyFromParent,
             DefaultVisual(dpy, lock->screen), CWOverrideRedirect | CWBackPixel, &wa);
+    XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), "grey", &color, &dummy);
+    lock->colors[3] = color.pixel;
+    XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), COLOR2, &color, &dummy);
+    XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), "orange red", &color, &dummy);
+    lock->colors[2] = color.pixel;
     XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), COLOR2, &color, &dummy);
     lock->colors[1] = color.pixel;
     XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), COLOR1, &color, &dummy);
